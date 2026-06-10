@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""doit — LLM-powered shell agent.
+
+Usage:
+  doit <natural language request>
+  doit --history          Show session history
+  doit --memories         Show stored memories
+  doit --forget KEY       Remove a memory
+  doit --clear-history    Clear this session's history
+  doit --agentic GOAL     Run an autonomous multi-step agentic loop
+
+Config:  ~/doit.cfg   (JSON)
+State:   ~/.doit/     (history.json, memory.json)
+Session: $DOIT_SESSION_ID  (default: "default")
+"""
+
+import os
+import sys
+import json
+import shutil
+import subprocess
+import uuid
+import re
+import argparse
+from pathlib import Path
+from datetime import datetime
+from typing import Optional
+
+try:
+    import litellm
+    from litellm import completion
+    litellm.suppress_debug_info = True
+except ImportError:
+    print("Error: litellm is required. Run: pip install litellm", file=sys.stderr)
+    sys.exit(1)
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+
+CONFIG_PATH = Path.home() / "doit.cfg"
+STATE_DIR   = Path.home() / ".doit"
+HISTORY_FILE = STATE_DIR / "history.json"
+MEMORY_FILE  = STATE_DIR / "memory.json"
+
+# ── Shell detection ──────────────────────────────────────────────────────────
+
+def _detect_shell():
+    user_shell = os.environ.get("SHELL", "")
+    if user_shell and os.path.exists(user_shell):
+        return user_shell, os.path.basename(user_shell)
+    if sys.platform == "win32":
+        for candidate in [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        ]:
+            if os.path.exists(candidate):
+                return candidate, "bash"
+    for name in ("bash", "zsh", "sh"):
+        path = shutil.which(name)
+        if path:
+            return path, name
+    return "/bin/sh", "sh"
+
+SHELL_PATH, SHELL_NAME = _detect_shell()
+
+# ── Shell execution ──────────────────────────────────────────────────────────
+
+def run_shell(command: str) -> dict:
+    try:
+        result = subprocess.run(
+            command, shell=True, executable=SHELL_PATH,
+            text=True, capture_output=True, timeout=30,
+        )
+        return {"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": "Command timed out after 30 seconds.", "returncode": 124}
+    except Exception as e:
+        return {"stdout": "", "stderr": str(e), "returncode": 1}
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    defaults = {
+        "model":      "gpt-4o-mini",
+        "api_key":    "",
+        "api_base":   "",
+        # "api"              → hosted API via LiteLLM (OpenAI, Anthropic, etc.)
+        # "local_no_tools"   → local model, no function-calling; JSON-in-prompt only
+        # "local_tools"      → local model with function-calling support (e.g., Ollama + llama3)
+        "model_type": "api",
+    }
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                defaults.update(json.load(f))
+        except Exception as e:
+            print(f"Warning: could not read {CONFIG_PATH}: {e}", file=sys.stderr)
+    return defaults
+
+# ── State helpers ────────────────────────────────────────────────────────────
+
+def _ensure_state():
+    STATE_DIR.mkdir(exist_ok=True)
+
+def load_history() -> list:
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def save_history(history: list):
+    _ensure_state()
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2, default=str)
+
+def load_memory() -> dict:
+    if MEMORY_FILE.exists():
+        try:
+            with open(MEMORY_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_memory(memory: dict):
+    _ensure_state()
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(memory, f, indent=2)
+
+def apply_memories(new_memories: list, memory: dict) -> dict:
+    for m in new_memories:
+        key   = m.get("key",   "").strip()
+        value = m.get("value", "").strip()
+        if not key:
+            continue
+        if value.lower() in ("", "null", "none", "forget", "delete"):
+            memory.pop(key, None)
+        else:
+            memory[key] = value
+    return memory
+
+# ── Shell history awareness ──────────────────────────────────────────────────
+
+def read_shell_history(n: int = 15) -> list:
+    candidates = []
+    if SHELL_NAME == "zsh":
+        candidates = [Path.home() / ".zsh_history"]
+    elif SHELL_NAME == "bash":
+        candidates = [Path.home() / ".bash_history"]
+    else:
+        candidates = [Path.home() / ".bash_history", Path.home() / ".zsh_history"]
+
+    for hf in candidates:
+        if not hf.exists():
+            continue
+        try:
+            lines = hf.read_text(errors="ignore").splitlines()
+            commands = []
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                # zsh extended history: ": 1234567890:0;actual command"
+                if re.match(r"^: \d+:\d+;", line):
+                    line = line.split(";", 1)[1]
+                commands.append(line)
+            return commands[-n:]
+        except Exception:
+            pass
+    return []
+
+# ── Prompt / message building ────────────────────────────────────────────────
+
+_SYSTEM_PROMPT = """\
+You are doit, an intelligent shell assistant. Translate user requests into shell \
+commands or answer questions about the shell/system.
+
+ALWAYS respond with a single JSON object — no markdown fences, no prose outside the JSON.
+
+Response types:
+
+1. Shell command (safe to execute immediately):
+{"type":"command","command":"<bash command>","description":"<what it does>","dangerous":false}
+
+2. Shell command (modifies filesystem, processes, or network config):
+{"type":"command","command":"<bash command>","description":"<what it does>","dangerous":true}
+
+3. Informational answer (no execution needed):
+{"type":"answer","text":"<your explanation>"}
+
+4. Cannot fulfill:
+{"type":"impossible","text":"<reason>"}
+
+5. Need clarification before acting:
+{"type":"clarification","question":"<your question>","options":["opt1","opt2"]}
+
+6. Multi-step task (sequence of commands needed, used only for the --agentic flag or clearly sequential tasks):
+{"type":"multi_step","description":"<overall goal>","steps":[{"command":"...","description":"...","dangerous":false},...]}
+
+Any type may include an optional top-level "memories" array to persist user facts:
+{"memories":[{"key":"preferred_editor","value":"vim"}]}
+Use an empty value to forget: {"key":"old_fact","value":""}
+
+Dangerous = true for: rm, rmdir, mv, cp (overwrite), chmod, chown, kill, pkill, sudo,
+package managers (apt/pip/brew), git push/reset --hard, curl|sh, dd, mkfs, truncate,
+write redirects (> file), systemctl stop/disable, and anything else that alters state.
+Dangerous = false for: ls, cat, head, tail, grep, find, ps, df, du, pwd, echo, which,
+man, stat, file, wc, diff, git log/status/diff, and other read-only operations.
+
+When a user says "execute it", "run it", "do it", or similar, execute the last suggested command.
+When a user asks a question like "how do I…", respond with type=answer, not type=command.
+"""
+
+def _build_messages(history: list, memory: dict, shell_hist: list,
+                    user_request: str, session_id: str) -> list:
+    # System message with injected context
+    sys_parts = [_SYSTEM_PROMPT]
+    sys_parts.append(f"\nCurrent directory: {os.getcwd()}")
+    sys_parts.append(f"Shell: {SHELL_NAME}  |  Session: {session_id}")
+
+    if memory:
+        lines = "\n".join(f"  {k}: {v}" for k, v in memory.items())
+        sys_parts.append(f"\nUser memory (persistent facts):\n{lines}")
+
+    if shell_hist:
+        lines = "\n".join(f"  $ {c}" for c in shell_hist)
+        sys_parts.append(f"\nRecent manual shell commands (for context):\n{lines}")
+
+    messages = [{"role": "system", "content": "\n".join(sys_parts)}]
+
+    # Inject last 10 turns from this session
+    session_entries = [e for e in history if e.get("session_id") == session_id][-10:]
+    for entry in session_entries:
+        messages.append({"role": "user", "content": entry["request"]})
+        resp = entry.get("response", {})
+        messages.append({"role": "assistant", "content": json.dumps(resp) if isinstance(resp, dict) else str(resp)})
+        # Execution output as a follow-up user message so the LLM knows what happened
+        ex = entry.get("execution")
+        if ex:
+            parts = []
+            if ex.get("stdout"):
+                parts.append(f"stdout:\n{ex['stdout'].rstrip()}")
+            if ex.get("stderr"):
+                parts.append(f"stderr:\n{ex['stderr'].rstrip()}")
+            parts.append(f"returncode: {ex.get('returncode', 0)}")
+            messages.append({"role": "user", "content": "[Execution result]\n" + "\n".join(parts)})
+
+    messages.append({"role": "user", "content": user_request})
+    return messages
+
+# ── LLM call ─────────────────────────────────────────────────────────────────
+
+def _call_llm(config: dict, messages: list) -> dict:
+    kwargs = {
+        "model":       config["model"],
+        "messages":    messages,
+        "temperature": 0.1,
+    }
+    if config.get("api_key"):
+        kwargs["api_key"] = config["api_key"]
+    if config.get("api_base"):
+        kwargs["api_base"] = config["api_base"]
+
+    response = completion(**kwargs)
+    content = response.choices[0].message.content.strip()
+
+    # Strip optional markdown code fence
+    content = re.sub(r"^```(?:json)?\s*", "", content)
+    content = re.sub(r"\s*```$", "", content)
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # Fallback: pull out the first {...} block
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group())
+            except Exception:
+                pass
+        # Give back raw text as an answer
+        return {"type": "answer", "text": content}
+
+# ── Response handlers ────────────────────────────────────────────────────────
+
+def _print_command(command: str, description: str):
+    print(f"\n\033[1m$ {command}\033[0m")
+    if description:
+        print(f"  \033[2m→ {description}\033[0m")
+
+def handle_command(resp: dict) -> Optional[dict]:
+    """Prompt if dangerous, then run. Returns execution dict or None if skipped."""
+    command     = resp.get("command", "").strip()
+    description = resp.get("description", "")
+    dangerous   = resp.get("dangerous", False)
+
+    if not command:
+        print("[Empty command — nothing to run]")
+        return None
+
+    _print_command(command, description)
+
+    if dangerous:
+        print("\n\033[33m⚠  This command modifies the system.\033[0m")
+        try:
+            ans = input("  Execute? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return None
+        if ans != "y":
+            print("Skipped.")
+            return None
+
+    result = run_shell(command)
+    if result["stdout"]:
+        print(result["stdout"].rstrip())
+    if result["stderr"]:
+        print(result["stderr"].rstrip(), file=sys.stderr)
+    if result["returncode"] != 0:
+        print(f"\033[31m[exit {result['returncode']}]\033[0m", file=sys.stderr)
+    return result
+
+
+def handle_multi_step(resp: dict) -> Optional[dict]:
+    """Execute a sequence of steps. Returns last execution dict."""
+    description = resp.get("description", "Multi-step task")
+    steps       = resp.get("steps", [])
+    print(f"\n\033[1m[Multi-step: {description}]\033[0m  ({len(steps)} steps)")
+
+    last_result = None
+    for i, step in enumerate(steps, 1):
+        print(f"\n\033[2m── Step {i}/{len(steps)} ──\033[0m")
+        result = handle_command({
+            "command":     step.get("command", ""),
+            "description": step.get("description", ""),
+            "dangerous":   step.get("dangerous", False),
+        })
+        if result is None:
+            print(f"[Stopped at step {i}]")
+            return last_result
+        last_result = result
+        if result["returncode"] != 0:
+            print(f"\n[Step {i} failed — stopping multi-step execution]")
+            return last_result
+    return last_result
+
+
+def handle_clarification(resp: dict, config: dict, history: list, memory: dict,
+                          shell_hist: list, session_id: str) -> Optional[dict]:
+    """Print the clarification question, get user answer, then recurse."""
+    question = resp.get("question", "")
+    options  = resp.get("options", [])
+
+    print(f"\n\033[1m? {question}\033[0m")
+    for i, opt in enumerate(options, 1):
+        print(f"  {i}. {opt}")
+
+    try:
+        answer = input("\nYour answer: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.")
+        return None
+
+    if not answer:
+        return None
+
+    print()
+    messages = _build_messages(history, memory, shell_hist, answer, session_id)
+    try:
+        resp2 = _call_llm(config, messages)
+    except Exception as e:
+        print(f"LLM error: {e}", file=sys.stderr)
+        return None
+    return _process_response(resp2, config, history, memory, shell_hist, session_id, answer)
+
+
+def _process_response(resp: dict, config: dict, history: list, memory: dict,
+                       shell_hist: list, session_id: str, request: str = "") -> dict:
+    """Dispatch to the right handler. Returns a history entry dict."""
+    # Memory side-effects
+    new_mems = resp.get("memories", [])
+    if new_mems:
+        apply_memories(new_mems, memory)
+        save_memory(memory)
+
+    rtype     = resp.get("type", "answer")
+    execution = None
+
+    if rtype == "command":
+        execution = handle_command(resp)
+
+    elif rtype == "multi_step":
+        execution = handle_multi_step(resp)
+
+    elif rtype == "answer":
+        print(f"\n{resp.get('text', '')}")
+
+    elif rtype == "impossible":
+        print(f"\n\033[33m[Cannot do that: {resp.get('text', '')}]\033[0m")
+
+    elif rtype == "clarification":
+        result_entry = handle_clarification(resp, config, history, memory, shell_hist, session_id)
+        return result_entry or _make_entry(request, resp, None, session_id)
+
+    else:
+        print(f"\n[Unknown response type '{rtype}': {resp}]")
+
+    return _make_entry(request, resp, execution, session_id)
+
+
+def _make_entry(request: str, response: dict, execution: Optional[dict], session_id: str) -> dict:
+    return {
+        "id":        str(uuid.uuid4()),
+        "session_id": session_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "cwd":       os.getcwd(),
+        "request":   request,
+        "response":  response,
+        "execution": execution,
+    }
+
+# ── Agentic loop (extension) ─────────────────────────────────────────────────
+
+_AGENTIC_SYSTEM = """\
+You are doit running in AGENTIC mode. The user has given you a high-level goal.
+You must accomplish it step by step by issuing shell commands, observing their output,
+and deciding what to do next.
+
+In each turn respond with ONE JSON object:
+
+Continue with another command:
+{"type":"agentic_step","command":"<cmd>","description":"<why>","dangerous":<bool>}
+
+Goal achieved — stop:
+{"type":"agentic_done","summary":"<what was accomplished>"}
+
+Need user input to continue:
+{"type":"agentic_ask","question":"<your question>"}
+
+Dangerous detection rules are the same as normal mode.
+Never loop forever: if you cannot make progress after 3 attempts, use agentic_done to stop.
+"""
+
+def run_agentic(goal: str, config: dict, memory: dict):
+    """Autonomous multi-step agentic loop for a high-level goal."""
+    print(f"\n\033[1m[Agentic mode — goal: {goal}]\033[0m\n")
+
+    sys_parts = [_AGENTIC_SYSTEM]
+    sys_parts.append(f"\nCurrent directory: {os.getcwd()}")
+    sys_parts.append(f"Shell: {SHELL_NAME}")
+    if memory:
+        lines = "\n".join(f"  {k}: {v}" for k, v in memory.items())
+        sys_parts.append(f"\nUser memory:\n{lines}")
+
+    messages = [
+        {"role": "system",  "content": "\n".join(sys_parts)},
+        {"role": "user",    "content": f"Goal: {goal}"},
+    ]
+
+    max_steps = 10
+    for step in range(1, max_steps + 1):
+        print(f"\033[2m── Agentic step {step}/{max_steps} ──\033[0m")
+        try:
+            resp = _call_llm(config, messages)
+        except Exception as e:
+            print(f"LLM error: {e}", file=sys.stderr)
+            break
+
+        rtype = resp.get("type", "")
+        messages.append({"role": "assistant", "content": json.dumps(resp)})
+
+        if rtype == "agentic_done":
+            print(f"\n\033[32m[Done] {resp.get('summary', '')}\033[0m")
+            break
+
+        elif rtype == "agentic_ask":
+            question = resp.get("question", "")
+            print(f"\n\033[1m? {question}\033[0m")
+            try:
+                answer = input("Your answer: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborted.")
+                break
+            messages.append({"role": "user", "content": answer})
+            continue
+
+        elif rtype == "agentic_step":
+            command     = resp.get("command", "").strip()
+            description = resp.get("description", "")
+            dangerous   = resp.get("dangerous", False)
+
+            if not command:
+                print("[Empty command — stopping]")
+                break
+
+            _print_command(command, description)
+
+            if dangerous:
+                print("\n\033[33m⚠  This command modifies the system.\033[0m")
+                try:
+                    ans = input("  Execute? [y/N] ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nAborted.")
+                    break
+                if ans != "y":
+                    messages.append({"role": "user", "content": "[User skipped this step]"})
+                    continue
+
+            result = run_shell(command)
+            if result["stdout"]:
+                print(result["stdout"].rstrip())
+            if result["stderr"]:
+                print(result["stderr"].rstrip(), file=sys.stderr)
+
+            feedback = f"[Execution result — returncode: {result['returncode']}]"
+            if result["stdout"]:
+                feedback += f"\nstdout:\n{result['stdout'].rstrip()}"
+            if result["stderr"]:
+                feedback += f"\nstderr:\n{result['stderr'].rstrip()}"
+            messages.append({"role": "user", "content": feedback})
+
+        else:
+            print(f"[Unexpected agentic response type '{rtype}' — stopping]")
+            break
+    else:
+        print("\033[33m[Reached maximum step limit]\033[0m")
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="doit",
+        description="LLM-powered shell agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  doit show me running processes sorted by memory\n"
+            "  doit delete all .pyc files in the current tree\n"
+            "  doit how do I undo the last git commit without losing changes?\n"
+            "  doit --agentic 'set up a Python venv and install requests'\n"
+            "  DOIT_SESSION_ID=work doit list open ports\n"
+        ),
+    )
+    parser.add_argument("request", nargs="*",        help="Natural language request")
+    parser.add_argument("--history",       action="store_true", help="Show this session's history")
+    parser.add_argument("--memories",      action="store_true", help="Show stored memories")
+    parser.add_argument("--forget",        metavar="KEY",       help="Remove a memory key")
+    parser.add_argument("--clear-history", action="store_true", help="Clear this session's history")
+    parser.add_argument("--agentic",       metavar="GOAL",      help="Autonomous multi-step agentic loop")
+    args = parser.parse_args()
+
+    session_id = os.environ.get("DOIT_SESSION_ID", "default")
+    config  = load_config()
+    _ensure_state()
+    history = load_history()
+    memory  = load_memory()
+
+    # ── Informational / management flags ─────────────────────────────────────
+
+    if args.memories:
+        if memory:
+            print("Stored memories:")
+            for k, v in memory.items():
+                print(f"  {k}: {v}")
+        else:
+            print("No memories stored.")
+        return
+
+    if args.forget:
+        if args.forget in memory:
+            del memory[args.forget]
+            save_memory(memory)
+            print(f"Forgotten: {args.forget}")
+        else:
+            print(f"No memory key '{args.forget}' found.")
+        return
+
+    if args.history:
+        entries = [e for e in history if e.get("session_id") == session_id]
+        if not entries:
+            print(f"No history for session '{session_id}'.")
+        else:
+            print(f"History for session '{session_id}' ({len(entries)} entries):")
+            for e in entries[-20:]:
+                ts  = e.get("timestamp", "")[:19]
+                req = e.get("request", "")
+                print(f"  [{ts}]  {req}")
+        return
+
+    if args.clear_history:
+        before = len(history)
+        history = [e for e in history if e.get("session_id") != session_id]
+        save_history(history)
+        print(f"Cleared {before - len(history)} entries for session '{session_id}'.")
+        return
+
+    # ── Agentic mode (extension) ──────────────────────────────────────────────
+
+    if args.agentic:
+        run_agentic(args.agentic, config, memory)
+        return
+
+    # ── Normal single-request mode ────────────────────────────────────────────
+
+    if not args.request:
+        parser.print_help()
+        return
+
+    user_request = " ".join(args.request)
+    shell_hist   = read_shell_history(15)
+
+    messages = _build_messages(history, memory, shell_hist, user_request, session_id)
+
+    try:
+        resp = _call_llm(config, messages)
+    except Exception as e:
+        print(f"Error calling LLM: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    entry = _process_response(resp, config, history, memory, shell_hist, session_id, user_request)
+    history.append(entry)
+    save_history(history)
+
+
+if __name__ == "__main__":
+    main()
