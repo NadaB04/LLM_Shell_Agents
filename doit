@@ -11,7 +11,7 @@ Usage:
 
 Config:  ~/doit.cfg   (JSON)
 State:   ~/.doit/     (history.json, memory.json)
-Session: $DOIT_SESSION_ID  (default: "default")
+Session: $DOIT_SESSION_ID  (default: parent shell PID — auto per terminal window)
 """
 
 import os
@@ -66,10 +66,17 @@ SHELL_PATH, SHELL_NAME = _detect_shell()
 
 def run_shell(command: str) -> dict:
     try:
-        result = subprocess.run(
-            command, shell=True, executable=SHELL_PATH,
-            text=True, capture_output=True, timeout=30,
-        )
+        if sys.platform == "win32" and SHELL_NAME.replace(".exe", "") in ("bash", "zsh", "sh"):
+            args = [SHELL_PATH, "-c", command]
+            result = subprocess.run(
+                args, shell=False,
+                text=True, capture_output=True, timeout=30,
+            )
+        else:
+            result = subprocess.run(
+                command, shell=True, executable=SHELL_PATH,
+                text=True, capture_output=True, timeout=30,
+            )
         return {"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
     except subprocess.TimeoutExpired:
         return {"stdout": "", "stderr": "Command timed out after 30 seconds.", "returncode": 124}
@@ -80,7 +87,7 @@ def run_shell(command: str) -> dict:
 
 def load_config() -> dict:
     defaults = {
-        "model":      "gpt-4o-mini",
+        "model":      "groq/llama-3.1-8b-instant",
         "api_key":    "",
         "api_base":   "",
         # "api"              → hosted API via LiteLLM (OpenAI, Anthropic, etc.)
@@ -228,6 +235,26 @@ def _build_messages(history: list, memory: dict, shell_hist: list,
         lines = "\n".join(f"  $ {c}" for c in shell_hist)
         sys_parts.append(f"\nRecent manual shell commands (for context):\n{lines}")
 
+    # Inject last 5 entries from other sessions so cross-session references work
+    other_sessions = {}
+    for e in history:
+        sid = e.get("session_id")
+        if sid and sid != session_id:
+            other_sessions.setdefault(sid, []).append(e)
+    if other_sessions:
+        parts = ["\nHistory from other sessions (for cross-session references):"]
+        for sid, entries in other_sessions.items():
+            for e in entries[-5:]:
+                cwd = e.get("cwd", "")
+                req = e.get("request", "")
+                resp = e.get("response", {})
+                cmd = resp.get("command", "") if isinstance(resp, dict) else ""
+                line = f"  [session={sid} cwd={cwd}] user: {req}"
+                if cmd:
+                    line += f" -> ran: {cmd}"
+                parts.append(line)
+        sys_parts.append("\n".join(parts))
+
     messages = [{"role": "system", "content": "\n".join(sys_parts)}]
 
     # Inject last 10 turns from this session
@@ -288,7 +315,7 @@ def _call_llm(config: dict, messages: list) -> dict:
 def _print_command(command: str, description: str):
     print(f"\n\033[1m$ {command}\033[0m")
     if description:
-        print(f"  \033[2m→ {description}\033[0m")
+        print(f"  \033[2m-> {description}\033[0m")
 
 def handle_command(resp: dict) -> Optional[dict]:
     """Prompt if dangerous, then run. Returns execution dict or None if skipped."""
@@ -297,13 +324,13 @@ def handle_command(resp: dict) -> Optional[dict]:
     dangerous   = resp.get("dangerous", False)
 
     if not command:
-        print("[Empty command — nothing to run]")
+        print("[Empty command - nothing to run]")
         return None
 
     _print_command(command, description)
 
     if dangerous:
-        print("\n\033[33m⚠  This command modifies the system.\033[0m")
+        print("\n\033[33m[!] This command modifies the system.\033[0m")
         try:
             ans = input("  Execute? [y/N] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -331,7 +358,7 @@ def handle_multi_step(resp: dict) -> Optional[dict]:
 
     last_result = None
     for i, step in enumerate(steps, 1):
-        print(f"\n\033[2m── Step {i}/{len(steps)} ──\033[0m")
+        print(f"\n\033[2m-- Step {i}/{len(steps)} --\033[0m")
         result = handle_command({
             "command":     step.get("command", ""),
             "description": step.get("description", ""),
@@ -342,7 +369,7 @@ def handle_multi_step(resp: dict) -> Optional[dict]:
             return last_result
         last_result = result
         if result["returncode"] != 0:
-            print(f"\n[Step {i} failed — stopping multi-step execution]")
+            print(f"\n[Step {i} failed - stopping multi-step execution]")
             return last_result
     return last_result
 
@@ -445,7 +472,7 @@ Never loop forever: if you cannot make progress after 3 attempts, use agentic_do
 
 def run_agentic(goal: str, config: dict, memory: dict):
     """Autonomous multi-step agentic loop for a high-level goal."""
-    print(f"\n\033[1m[Agentic mode — goal: {goal}]\033[0m\n")
+    print(f"\n\033[1m[Agentic mode - goal: {goal}]\033[0m\n")
 
     sys_parts = [_AGENTIC_SYSTEM]
     sys_parts.append(f"\nCurrent directory: {os.getcwd()}")
@@ -461,7 +488,7 @@ def run_agentic(goal: str, config: dict, memory: dict):
 
     max_steps = 10
     for step in range(1, max_steps + 1):
-        print(f"\033[2m── Agentic step {step}/{max_steps} ──\033[0m")
+        print(f"\033[2m-- Agentic step {step}/{max_steps} --\033[0m")
         try:
             resp = _call_llm(config, messages)
         except Exception as e:
@@ -492,13 +519,13 @@ def run_agentic(goal: str, config: dict, memory: dict):
             dangerous   = resp.get("dangerous", False)
 
             if not command:
-                print("[Empty command — stopping]")
+                print("[Empty command - stopping]")
                 break
 
             _print_command(command, description)
 
             if dangerous:
-                print("\n\033[33m⚠  This command modifies the system.\033[0m")
+                print("\n\033[33m[!] This command modifies the system.\033[0m")
                 try:
                     ans = input("  Execute? [y/N] ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
@@ -522,7 +549,7 @@ def run_agentic(goal: str, config: dict, memory: dict):
             messages.append({"role": "user", "content": feedback})
 
         else:
-            print(f"[Unexpected agentic response type '{rtype}' — stopping]")
+            print(f"[Unexpected agentic response type '{rtype}' - stopping]")
             break
     else:
         print("\033[33m[Reached maximum step limit]\033[0m")
@@ -551,7 +578,7 @@ def main():
     parser.add_argument("--agentic",       metavar="GOAL",      help="Autonomous multi-step agentic loop")
     args = parser.parse_args()
 
-    session_id = os.environ.get("DOIT_SESSION_ID", "default")
+    session_id = os.environ.get("DOIT_SESSION_ID") or str(os.getppid())
     config  = load_config()
     _ensure_state()
     history = load_history()
