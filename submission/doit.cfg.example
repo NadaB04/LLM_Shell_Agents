@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy this file to ~/doit.cfg and fill in your values.",
+
+  "model":      "gpt-4o-mini",
+  "api_key":    "sk-...",
+  "api_base":   "",
+  "model_type": "api"
+}
