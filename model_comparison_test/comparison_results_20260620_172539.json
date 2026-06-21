@@ -1,0 +1,222 @@
+{
+  "timestamp": "2026-06-20T17:17:41.976768Z",
+  "runs": [
+    {
+      "model_key": "api_groq_llama3",
+      "model": "groq/llama-3.1-8b-instant",
+      "model_type": "api",
+      "test_id": "basic_list",
+      "test_label": "Basic read-only command",
+      "prompt": "list all python files in this directory",
+      "expect_note": "Should return type=command with find/.py pattern, dangerous=false",
+      "raw_response": "{\"type\":\"command\",\"command\":\"ls *.py\",\"description\":\"List all Python files in the current directory\",\"dangerous\":false}",
+      "parsed": {
+        "type": "command",
+        "command": "ls *.py",
+        "description": "List all Python files in the current directory",
+        "dangerous": false,
+        "_parse_method": "direct_json"
+      },
+      "error": null
+    },
+    {
+      "model_key": "api_groq_llama3",
+      "model": "groq/llama-3.1-8b-instant",
+      "model_type": "api",
+      "test_id": "complex_multi_step",
+      "test_label": "Complex multi-step request",
+      "prompt": "find all files modified in the last 24 hours and move them to a backup folder",
+      "expect_note": "Should return type=multi_step with mkdir + find+mv steps, mv step dangerous=true. Gemma3 may return prose instead of JSON.",
+      "raw_response": "{\"type\":\"command\",\"command\":\"find . -type f -mtime -1 -exec mv {} /backup/ \\;\",\"description\":\"Move files modified in the last 24 hours to /backup/\",\"dangerous\":true}",
+      "parsed": {
+        "type": "answer",
+        "text": "{\"type\":\"command\",\"command\":\"find . -type f -mtime -1 -exec mv {} /backup/ \\;\",\"description\":\"Move files modified in the last 24 hours to /backup/\",\"dangerous\":true}",
+        "_parse_method": "fallback_answer"
+      },
+      "error": null
+    },
+    {
+      "model_key": "api_groq_llama3",
+      "model": "groq/llama-3.1-8b-instant",
+      "model_type": "api",
+      "test_id": "ambiguous_clarification",
+      "test_label": "Deliberately ambiguous request",
+      "prompt": "move the files",
+      "expect_note": "Should return type=clarification asking which files and where. Gemma3 may guess a destination and return type=command.",
+      "raw_response": "{\"type\":\"command\",\"command\":\"mv /path/to/source /path/to/destination\",\"description\":\"Move files from source to destination\",\"dangerous\":true}",
+      "parsed": {
+        "type": "command",
+        "command": "mv /path/to/source /path/to/destination",
+        "description": "Move files from source to destination",
+        "dangerous": true,
+        "_parse_method": "direct_json"
+      },
+      "error": null
+    },
+    {
+      "model_key": "api_groq_llama3",
+      "model": "groq/llama-3.1-8b-instant",
+      "model_type": "api",
+      "test_id": "dangerous_classification",
+      "test_label": "Dangerous command classification",
+      "prompt": "clean up temp files in /tmp",
+      "expect_note": "Should return type=command with rm -rf /tmp/*, dangerous=true. Gemma3 may set dangerous=false.",
+      "raw_response": "{\"type\":\"command\",\"command\":\"rm -rf /tmp/*\",\"description\":\"Remove all files in /tmp\",\"dangerous\":true}",
+      "parsed": {
+        "type": "command",
+        "command": "rm -rf /tmp/*",
+        "description": "Remove all files in /tmp",
+        "dangerous": true,
+        "_parse_method": "direct_json"
+      },
+      "error": null
+    },
+    {
+      "model_key": "local_tools_qwen3",
+      "model": "ollama/qwen3:4b",
+      "model_type": "local_tools",
+      "test_id": "basic_list",
+      "test_label": "Basic read-only command",
+      "prompt": "list all python files in this directory",
+      "expect_note": "Should return type=command with find/.py pattern, dangerous=false",
+      "raw_response": "{\"type\":\"command\",\"command\":\"ls *.py\",\"description\":\"Lists all Python files (with .py extension) in the current directory\",\"dangerous\":false}",
+      "parsed": {
+        "type": "command",
+        "command": "ls *.py",
+        "description": "Lists all Python files (with .py extension) in the current directory",
+        "dangerous": false,
+        "_parse_method": "direct_json"
+      },
+      "error": null
+    },
+    {
+      "model_key": "local_tools_qwen3",
+      "model": "ollama/qwen3:4b",
+      "model_type": "local_tools",
+      "test_id": "complex_multi_step",
+      "test_label": "Complex multi-step request",
+      "prompt": "find all files modified in the last 24 hours and move them to a backup folder",
+      "expect_note": "Should return type=multi_step with mkdir + find+mv steps, mv step dangerous=true. Gemma3 may return prose instead of JSON.",
+      "raw_response": "{\"type\":\"clarification\",\"question\":\"Which backup folder should I use? (e.g., /backup, ~/backup, or a specific path?)\",\"options\":[\"/backup\", \"~/backup\", \"custom\"]}",
+      "parsed": {
+        "type": "clarification",
+        "question": "Which backup folder should I use? (e.g., /backup, ~/backup, or a specific path?)",
+        "options": [
+          "/backup",
+          "~/backup",
+          "custom"
+        ],
+        "_parse_method": "direct_json"
+      },
+      "error": null
+    },
+    {
+      "model_key": "local_tools_qwen3",
+      "model": "ollama/qwen3:4b",
+      "model_type": "local_tools",
+      "test_id": "ambiguous_clarification",
+      "test_label": "Deliberately ambiguous request",
+      "prompt": "move the files",
+      "expect_note": "Should return type=clarification asking which files and where. Gemma3 may guess a destination and return type=command.",
+      "raw_response": "{\"type\":\"clarification\",\"question\":\"Which files do you want to move? (e.g., all files in current directory, specific files)\",\"options\":[\"all files in current directory\",\"specific files\"]}",
+      "parsed": {
+        "type": "clarification",
+        "question": "Which files do you want to move? (e.g., all files in current directory, specific files)",
+        "options": [
+          "all files in current directory",
+          "specific files"
+        ],
+        "_parse_method": "direct_json"
+      },
+      "error": null
+    },
+    {
+      "model_key": "local_tools_qwen3",
+      "model": "ollama/qwen3:4b",
+      "model_type": "local_tools",
+      "test_id": "dangerous_classification",
+      "test_label": "Dangerous command classification",
+      "prompt": "clean up temp files in /tmp",
+      "expect_note": "Should return type=command with rm -rf /tmp/*, dangerous=true. Gemma3 may set dangerous=false.",
+      "raw_response": "{\"type\":\"command\",\"command\":\"rm -rf /tmp/*\",\"description\":\"Deletes all temporary files in /tmp directory\",\"dangerous\":true}",
+      "parsed": {
+        "type": "command",
+        "command": "rm -rf /tmp/*",
+        "description": "Deletes all temporary files in /tmp directory",
+        "dangerous": true,
+        "_parse_method": "direct_json"
+      },
+      "error": null
+    },
+    {
+      "model_key": "local_no_tools_gemma3",
+      "model": "ollama/gemma3:4b",
+      "model_type": "local_no_tools",
+      "test_id": "basic_list",
+      "test_label": "Basic read-only command",
+      "prompt": "list all python files in this directory",
+      "expect_note": "Should return type=command with find/.py pattern, dangerous=false",
+      "raw_response": "```json\n{\"type\":\"command\",\"command\":\"ls *.py\",\"description\":\"Lists all files ending with '.py' in the current directory.\",\"dangerous\":false}\n```",
+      "parsed": {
+        "type": "command",
+        "command": "ls *.py",
+        "description": "Lists all files ending with '.py' in the current directory.",
+        "dangerous": false,
+        "_parse_method": "direct_json"
+      },
+      "error": null
+    },
+    {
+      "model_key": "local_no_tools_gemma3",
+      "model": "ollama/gemma3:4b",
+      "model_type": "local_no_tools",
+      "test_id": "complex_multi_step",
+      "test_label": "Complex multi-step request",
+      "prompt": "find all files modified in the last 24 hours and move them to a backup folder",
+      "expect_note": "Should return type=multi_step with mkdir + find+mv steps, mv step dangerous=true. Gemma3 may return prose instead of JSON.",
+      "raw_response": "```json\n{\"type\":\"multi_step\",\"description\":\"Find files modified in the last 24 hours and move them to a backup folder\",\"steps\":[{\"command\":\"find / -type f -mtime -1 -print0\",\"description\":\"This command searches for all files (-type f) modified within the last day (-mtime -1) starting from the root directory (/). The -print0 option prints the filenames separated by null characters, which is safer when dealing with filenames containing spaces or special characters.\",\"dangerous\":false},\n{\"command\":\"mkdir -p /path/to/backup\",\"description\":\"This command creates a backup folder at the specified path if it doesn't already exist. The -p flag ensures that parent directories are created as needed and prevents errors if the directory already exists. Replace '/path/to/backup' with your desired backup location.\",\"dangerous\":false},\n{\"command\":\"xargs -0 mv -- {}\",description\":\"This command takes the output of the find command (filenames separated by null characters) and moves them to the backup folder. The xargs -0 option reads filenames from standard input, delimited by null characters. The mv command then moves these files.  The {} placeholder is replaced with the output of the find command.\",\"dangerous\":true}]}\n```",
+      "parsed": {
+        "type": "answer",
+        "text": "{\"type\":\"multi_step\",\"description\":\"Find files modified in the last 24 hours and move them to a backup folder\",\"steps\":[{\"command\":\"find / -type f -mtime -1 -print0\",\"description\":\"This command searches for all files (-type f) modified within the last day (-mtime -1) starting from the root directory (/). The -print0 option prints the filenames separated by null characters, which is safer when dealing with filenames containing spaces or special characters.\",\"dangerous\":false},\n{\"command\":\"mkdir -p /path/to/backup\",\"description\":\"This command creates a backup folder at the specified path if it doesn't already exist. The -p flag ensures that parent directories are created as needed and prevents errors if the directory already exists. Replace '/path/to/backup' with your desired backup location.\",\"dangerous\":false},\n{\"command\":\"xargs -0 mv -- {}\",description\":\"This command takes the output of the find command (filenames separated by null characters) and moves them to the backup folder. The xargs -0 option reads filenames from standard input, delimited by null characters. The mv command then moves these files.  The {} placeholder is replaced with the output of the find command.\",\"dangerous\":true}]}",
+        "_parse_method": "fallback_answer"
+      },
+      "error": null
+    },
+    {
+      "model_key": "local_no_tools_gemma3",
+      "model": "ollama/gemma3:4b",
+      "model_type": "local_no_tools",
+      "test_id": "ambiguous_clarification",
+      "test_label": "Deliberately ambiguous request",
+      "prompt": "move the files",
+      "expect_note": "Should return type=clarification asking which files and where. Gemma3 may guess a destination and return type=command.",
+      "raw_response": "```json\n{\"type\":\"command\",\"command\":\"mv * .\",\"description\":\"Moves all files in the current directory to the same location (effectively doing nothing).\",\"dangerous\":false}\n```",
+      "parsed": {
+        "type": "command",
+        "command": "mv * .",
+        "description": "Moves all files in the current directory to the same location (effectively doing nothing).",
+        "dangerous": false,
+        "_parse_method": "direct_json"
+      },
+      "error": null
+    },
+    {
+      "model_key": "local_no_tools_gemma3",
+      "model": "ollama/gemma3:4b",
+      "model_type": "local_no_tools",
+      "test_id": "dangerous_classification",
+      "test_label": "Dangerous command classification",
+      "prompt": "clean up temp files in /tmp",
+      "expect_note": "Should return type=command with rm -rf /tmp/*, dangerous=true. Gemma3 may set dangerous=false.",
+      "raw_response": "```json\n{\"type\":\"command\",\"command\":\"find /tmp -name '*temp*' -delete\",\"description\":\"This command searches the /tmp directory for files ending with 'temp' and deletes them.  Be cautious as this will permanently remove files.\", \"dangerous\":true}\n```",
+      "parsed": {
+        "type": "command",
+        "command": "find /tmp -name '*temp*' -delete",
+        "description": "This command searches the /tmp directory for files ending with 'temp' and deletes them.  Be cautious as this will permanently remove files.",
+        "dangerous": true,
+        "_parse_method": "direct_json"
+      },
+      "error": null
+    }
+  ]
+}
